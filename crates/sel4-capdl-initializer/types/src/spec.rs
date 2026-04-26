@@ -207,6 +207,7 @@ impl<D> Object<D> {
         match self {
             Self::Untyped(obj) => obj.paddr,
             Self::Frame(obj) => obj.paddr,
+            Self::PageTable(obj) => obj.paddr,
             _ => None,
         }
     }
@@ -447,6 +448,7 @@ pub mod object {
         pub x86_ept: bool,
         pub is_root: bool,
         pub level: Option<u8>,
+        pub paddr: Option<Word>,
         pub slots: Vec<CapTableEntry>,
     }
 

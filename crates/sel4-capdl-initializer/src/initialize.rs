@@ -194,23 +194,49 @@ impl<'a> Initializer<'a> {
             );
         }
 
+        // Count normal root objects by physical size. Unlike the original
+        // implementation, this does not assume that root_objects() is already
+        // sorted by descending physical_size_bits.
+        //
+        // by_size_start[bits] is the number of already-created objects in the
+        // size bucket. by_size_end[bits] is the total number of allocatable
+        // non-paddr, non-embedded objects in that bucket.
         let mut by_size_start: [usize; sel4::WORD_SIZE] = array::from_fn(|_| 0);
         let mut by_size_end: [usize; sel4::WORD_SIZE] = array::from_fn(|_| 0);
         {
             for obj_id in first_obj_without_paddr..self.root_objects().len() {
-                let obj = &self.object(obj_id.into());
+                let named_obj = self.named_object(obj_id.into());
+                let obj = &named_obj.object;
+
                 if let Some(blueprint) = obj.blueprint() {
+                    if let ArchivedObject::Frame(frame) = self.object(obj_id.into())
+                        && frame.init.is_embedded()
+                    {
+                        debug!(
+                            "Skipping embedded frame in size buckets: obj_id={} name={:?} size_bits={} blueprint={:?}",
+                            obj_id,
+                            object_name_or_default(named_obj),
+                            blueprint.physical_size_bits(),
+                            blueprint
+                        );
+                        continue;
+                    }
+
                     by_size_end[blueprint.physical_size_bits()] += 1;
                 }
             }
-            let mut acc = first_obj_without_paddr;
-            for (bits, n) in by_size_end.iter_mut().enumerate().rev() {
-                by_size_start[bits] = acc;
-                acc += *n;
-                *n = acc;
-            }
         }
 
+        debug!("Object counts by size_bits after bucket construction:");
+        for bits in 0..sel4::WORD_SIZE {
+            if by_size_end[bits] != 0 {
+                debug!(
+                    "  size_bits={}: total allocatable normal objects={}",
+                    bits,
+                    by_size_end[bits]
+                );
+            }
+        }
         // In order to allocate objects which specify paddrs, we may have to
         // allocate dummies to manipulate watermarks. We must always retain at
         // least one reference to an object allocated from an untyped, or else
@@ -256,37 +282,64 @@ impl<'a> Initializer<'a> {
                     let mut created = false;
                     if !ut.is_device() {
                         for size_bits in (0..=max_size_bits).rev() {
-                            let obj_id = &mut by_size_start[size_bits];
-                            // Skip embedded frames
-                            while *obj_id < by_size_end[size_bits] {
-                                if let ArchivedObject::Frame(obj) = self.object((*obj_id).into())
-                                    && obj.init.is_embedded()
+                            let bucket_pos = &mut by_size_start[size_bits];
+
+                            // Find the next not-yet-created object in this size bucket.
+                            // This scans root_objects() and selects the bucket_pos-th
+                            // allocatable object whose physical_size_bits() equals size_bits.
+                            // Therefore the allocator no longer depends on root_objects()
+                            // being sorted by size.
+                            if *bucket_pos < by_size_end[size_bits] {
+                                let mut seen_in_bucket = 0usize;
+                                let mut selected_obj_id = None;
+
+                                for candidate_obj_id in
+                                    first_obj_without_paddr..self.root_objects().len()
                                 {
-                                    *obj_id += 1;
-                                    continue;
+                                    let candidate_obj = self.object(candidate_obj_id.into());
+                                    let Some(candidate_blueprint) = candidate_obj.blueprint() else {
+                                        continue;
+                                    };
+
+                                    if candidate_blueprint.physical_size_bits() != size_bits {
+                                        continue;
+                                    }
+
+                                    if let ArchivedObject::Frame(frame) = candidate_obj
+                                        && frame.init.is_embedded()
+                                    {
+                                        continue;
+                                    }
+
+                                    if seen_in_bucket == *bucket_pos {
+                                        selected_obj_id = Some(candidate_obj_id);
+                                        break;
+                                    }
+
+                                    seen_in_bucket += 1;
                                 }
-                                break;
-                            }
-                            // debug!("Creating kernel objects!");
-                            // Create a largest possible object that would fit
-                            if *obj_id < by_size_end[size_bits] {
-                                let named_obj = &self.named_object((*obj_id).into());
+
+                                let obj_id = selected_obj_id.expect(
+                                    "by_size bucket counter is inconsistent with root object scan",
+                                );
+                                let named_obj = &self.named_object(obj_id.into());
                                 let blueprint = named_obj.object.blueprint().unwrap();
                                 assert_eq!(blueprint.physical_size_bits(), size_bits);
                                 trace!(
-                                    "Creating kernel object: paddr=0x{:x}, size_bits={} name={:?}",
+                                    "Creating kernel object: paddr=0x{:x}, size_bits={} obj_id={} name={:?}",
                                     cur_paddr,
                                     blueprint.physical_size_bits(),
+                                    obj_id,
                                     object_name_or_default(named_obj)
                                 );
                                 self.ut_cap(*i_ut).untyped_retype(
                                     &blueprint,
                                     &init_thread_cnode_absolute_cptr(),
-                                    self.orig_cslot((*obj_id).into()).index(),
+                                    self.orig_cslot(obj_id.into()).index(),
                                     1,
                                 )?;
                                 cur_paddr += 1 << size_bits;
-                                *obj_id += 1;
+                                *bucket_pos += 1;
                                 created = true;
                                 break;
                             }
@@ -339,6 +392,24 @@ impl<'a> Initializer<'a> {
             }
         }
 
+
+        if next_obj_with_paddr != num_objs_with_paddr {
+            error!(
+                "Error: did not create all fixed-paddr objects: created {}/{}",
+                next_obj_with_paddr, num_objs_with_paddr
+            );
+            for obj_id in next_obj_with_paddr..num_objs_with_paddr {
+                let named_obj = self.named_object(obj_id.into());
+                error!(
+                    "  missing fixed-paddr obj_id={} name={:?} paddr={:?} blueprint={:?}",
+                    obj_id,
+                    object_name_or_default(named_obj),
+                    named_obj.object.paddr(),
+                    named_obj.object.blueprint()
+                );
+            }
+            panic!("Not all fixed-paddr objects were created.");
+        }
         // Ensure that we've created every root object
         let mut oom = false;
         for bits in 0..sel4::WORD_SIZE {
